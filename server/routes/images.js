@@ -39,17 +39,34 @@ const upload = multer({
     fileFilter: (req, file, cb) => cb(null, file.mimetype in ALLOWED_TYPES),
 });
 
+// Shared columns for every image listing; $1 is the current user's id (or null)
+const IMAGE_SELECT = `
+    SELECT i.id, i.title, i.s3_key, i.tags, u.username AS uploader,
+           COUNT(l.user_id)::int AS like_count,
+           COALESCE(BOOL_OR(l.user_id = $1), false) AS liked_by_me
+    FROM images i
+    LEFT JOIN users u ON u.id = i.user_id
+    LEFT JOIN likes l ON l.image_id = i.id`;
+
+const MAX_RECOMMENDED = 12;
+
+async function toImageJson(r) {
+    return {
+        id: r.id,
+        title: r.title,
+        uploader: r.uploader,
+        tags: r.tags,
+        likeCount: r.like_count,
+        likedByMe: r.liked_by_me,
+        url: await signedUrl(r.s3_key),
+    };
+}
+
 router.get('/', async (req, res) => {
     const q = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, MAX_QUERY_LENGTH) : '';
     const tag = typeof req.query.tag === 'string' ? normalizeTag(req.query.tag) : '';
     try {
-        const { rows } = await pool.query(`
-            SELECT i.id, i.title, i.s3_key, i.tags, u.username AS uploader,
-                   COUNT(l.user_id)::int AS like_count,
-                   COALESCE(BOOL_OR(l.user_id = $1), false) AS liked_by_me
-            FROM images i
-            LEFT JOIN users u ON u.id = i.user_id
-            LEFT JOIN likes l ON l.image_id = i.id
+        const { rows } = await pool.query(`${IMAGE_SELECT}
             WHERE ($2::text IS NULL
                    OR i.title ILIKE $2
                    OR u.username ILIKE $2
@@ -59,20 +76,51 @@ router.get('/', async (req, res) => {
             ORDER BY i.created_at DESC`,
             [req.session.userId ?? null, q ? `%${escapeLike(q)}%` : null, tag || null]
         );
-        const images = await Promise.all(rows.map(async (r) => ({
-            id: r.id,
-            title: r.title,
-            uploader: r.uploader,
-            tags: r.tags,
-            likeCount: r.like_count,
-            likedByMe: r.liked_by_me,
-            url: await signedUrl(r.s3_key),
-        })));
-        res.json(images);
+        res.json(await Promise.all(rows.map(toImageJson)));
     } catch (err) {
-    console.error('GET /api/images failed:', err);
-    res.status(500).json({ error: 'Failed to load images' });
-}
+        console.error('GET /api/images failed:', err);
+        res.status(500).json({ error: 'Failed to load images' });
+    }
+});
+
+router.get('/:id', async (req, res) => {
+    const imageId = Number(req.params.id);
+    if (!Number.isInteger(imageId)) return res.status(400).json({ error: 'Invalid image id' });
+    try {
+        const { rows } = await pool.query(`${IMAGE_SELECT}
+            WHERE i.id = $2
+            GROUP BY i.id, u.username`,
+            [req.session.userId ?? null, imageId]
+        );
+        if (rows.length === 0) return res.status(404).json({ error: 'Image not found' });
+        res.json(await toImageJson(rows[0]));
+    } catch (err) {
+        console.error(`GET /api/images/${req.params.id} failed:`, err);
+        res.status(500).json({ error: 'Failed to load image' });
+    }
+});
+
+// Other images ranked by tags shared with this one, then popularity, then recency.
+// Images with no shared tags still fill the list so there's always something to show.
+router.get('/:id/recommended', async (req, res) => {
+    const imageId = Number(req.params.id);
+    if (!Number.isInteger(imageId)) return res.status(400).json({ error: 'Invalid image id' });
+    try {
+        const { rows } = await pool.query(`${IMAGE_SELECT}
+            CROSS JOIN (SELECT tags FROM images WHERE id = $2) target
+            WHERE i.id <> $2
+            GROUP BY i.id, u.username, target.tags
+            ORDER BY cardinality(ARRAY(SELECT unnest(i.tags) INTERSECT SELECT unnest(target.tags))) DESC,
+                     like_count DESC,
+                     i.created_at DESC
+            LIMIT $3`,
+            [req.session.userId ?? null, imageId, MAX_RECOMMENDED]
+        );
+        res.json(await Promise.all(rows.map(toImageJson)));
+    } catch (err) {
+        console.error(`GET /api/images/${req.params.id}/recommended failed:`, err);
+        res.status(500).json({ error: 'Failed to load recommendations' });
+    }
 });
 
 // requireAuth runs first so anonymous requests are rejected before the file is buffered
